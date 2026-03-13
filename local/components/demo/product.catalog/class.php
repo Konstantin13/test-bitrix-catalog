@@ -3,13 +3,24 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true) {
     die();
 }
 
+use Bitrix\Catalog\GroupTable;
 use Bitrix\Catalog\PriceTable;
 use Bitrix\Catalog\ProductTable;
+use Bitrix\Currency\CurrencyManager;
+use Bitrix\Iblock\ElementTable;
+use Bitrix\Iblock\IblockTable;
+use Bitrix\Main\Application;
+use Bitrix\Main\Context;
 use Bitrix\Main\Loader;
+use Bitrix\Main\ORM\Fields\Relations\Reference;
+use Bitrix\Main\ORM\Query\Join;
 use Bitrix\Main\SystemException;
+use Bitrix\Main\Type\DateTime;
 
 class DemoProductCatalogComponent extends CBitrixComponent
 {
+    private array $currencySymbols = [];
+
     public function onPrepareComponentParams($arParams)
     {
         $arParams['IBLOCK_ID'] = (int)($arParams['IBLOCK_ID'] ?? 0);
@@ -26,6 +37,10 @@ class DemoProductCatalogComponent extends CBitrixComponent
         if (!Loader::includeModule('iblock') || !Loader::includeModule('catalog')) {
             ShowError('Не удалось подключить модули iblock и catalog');
             return;
+        }
+
+        if (Loader::includeModule('currency')) {
+            $this->currencySymbols = CurrencyManager::getSymbolList();
         }
 
         if ($this->arParams['IBLOCK_ID'] <= 0) {
@@ -57,7 +72,7 @@ class DemoProductCatalogComponent extends CBitrixComponent
 
     private function resolveSortDirection(): string
     {
-        $sort = (string)($_REQUEST['sort'] ?? 'asc');
+        $sort = (string)Context::getCurrent()->getRequest()->getQuery('sort');
         $sort = strtolower($sort);
 
         return $sort === 'desc' ? 'desc' : 'asc';
@@ -66,113 +81,146 @@ class DemoProductCatalogComponent extends CBitrixComponent
     private function loadItems(string $sortDirection): array
     {
         $iblockId = (int)$this->arParams['IBLOCK_ID'];
-        $basePriceGroup = CCatalogGroup::GetBaseGroup();
-
-        if (!$basePriceGroup || empty($basePriceGroup['ID'])) {
+        $basePriceGroupId = GroupTable::getBasePriceTypeId();
+        if ($basePriceGroupId === null || $basePriceGroupId <= 0) {
             throw new SystemException('Не найден базовый тип цены');
         }
 
-        $basePriceGroupId = (int)$basePriceGroup['ID'];
-        $sortField = 'CATALOG_PRICE_' . $basePriceGroupId;
-        $elementIds = [];
-        $itemsById = [];
+        $now = new DateTime();
+        $filter = [
+            '=IBLOCK_ID' => $iblockId,
+            '=ACTIVE' => 'Y',
+            [
+                'LOGIC' => 'OR',
+                '=ACTIVE_FROM' => null,
+                '<=ACTIVE_FROM' => $now,
+            ],
+            [
+                'LOGIC' => 'OR',
+                '=ACTIVE_TO' => null,
+                '>=ACTIVE_TO' => $now,
+            ],
+        ];
 
-        $elements = CIBlockElement::GetList(
-            [
-                $sortField => strtoupper($sortDirection),
-                'ID' => 'ASC',
-            ],
-            [
-                'IBLOCK_ID' => $iblockId,
-                'ACTIVE' => 'Y',
-                'ACTIVE_DATE' => 'Y',
-            ],
-            false,
-            ['nTopCount' => (int)$this->arParams['PAGE_ELEMENT_COUNT']],
-            ['ID', 'IBLOCK_ID', 'NAME', 'DETAIL_PAGE_URL']
+        $query = ElementTable::query();
+        $query->setSelect([
+            'ID',
+            'NAME',
+            'CODE',
+            'XML_ID',
+            'IBLOCK_ID',
+            'IBLOCK_SECTION_ID',
+            'IBLOCK_TYPE_ID' => 'IBLOCK.IBLOCK_TYPE_ID',
+            'IBLOCK_CODE' => 'IBLOCK.CODE',
+            'IBLOCK_XML_ID' => 'IBLOCK.XML_ID',
+            'DETAIL_URL_TEMPLATE' => 'IBLOCK.DETAIL_PAGE_URL',
+            'PRICE_VALUE' => 'PRICE.PRICE',
+            'PRICE_CURRENCY' => 'PRICE.CURRENCY',
+            'QUANTITY_VALUE' => 'PRODUCT.QUANTITY',
+        ]);
+        $query->registerRuntimeField(
+            new Reference(
+                'IBLOCK',
+                IblockTable::class,
+                Join::on('this.IBLOCK_ID', 'ref.ID')
+            )
         );
+        $query->registerRuntimeField(
+            new Reference(
+                'PRICE',
+                PriceTable::class,
+                Join::on('this.ID', 'ref.PRODUCT_ID')
+                    ->where('ref.CATALOG_GROUP_ID', '=', $basePriceGroupId)
+                    ->whereNull('ref.QUANTITY_FROM')
+                    ->whereNull('ref.QUANTITY_TO')
+            )
+        );
+        $query->registerRuntimeField(
+            new Reference(
+                'PRODUCT',
+                ProductTable::class,
+                Join::on('this.ID', 'ref.ID')
+            )
+        );
+        $query->setFilter($filter);
+        $query->setOrder([
+            'PRICE_VALUE' => strtoupper($sortDirection),
+            'ID' => 'ASC',
+        ]);
+        $query->setLimit((int)$this->arParams['PAGE_ELEMENT_COUNT']);
 
-        while ($item = $elements->GetNext()) {
-            $elementId = (int)$item['ID'];
-            $elementIds[] = $elementId;
-            $itemsById[$elementId] = [
-                'ID' => $elementId,
-                'NAME' => (string)$item['NAME'],
-                'DETAIL_PAGE_URL' => (string)$item['DETAIL_PAGE_URL'],
-                'PRICE' => null,
-                'PRICE_FORMATTED' => '—',
-                'QUANTITY' => 0.0,
+        $rows = [];
+        $result = $query->exec();
+        while ($row = $result->fetch()) {
+            $rows[] = $row;
+        }
+
+        $items = [];
+        foreach ($rows as $row) {
+            $priceValue = $row['PRICE_VALUE'] !== null ? (float)$row['PRICE_VALUE'] : null;
+            $currency = (string)($row['PRICE_CURRENCY'] ?? '');
+            $items[] = [
+                'ID' => (int)$row['ID'],
+                'NAME' => (string)$row['NAME'],
+                'DETAIL_PAGE_URL' => $this->buildDetailUrl($row),
+                'PRICE' => $priceValue,
+                'PRICE_FORMATTED' => $priceValue !== null ? $this->formatPrice($priceValue, $currency) : '—',
+                'QUANTITY' => (float)($row['QUANTITY_VALUE'] ?? 0),
             ];
         }
 
-        if ($elementIds) {
-            $prices = $this->loadPrices($elementIds, $basePriceGroupId);
-            $quantities = $this->loadQuantities($elementIds);
-
-            foreach ($elementIds as $elementId) {
-                if (isset($prices[$elementId])) {
-                    $priceValue = (float)$prices[$elementId]['PRICE'];
-                    $currency = (string)$prices[$elementId]['CURRENCY'];
-                    $itemsById[$elementId]['PRICE'] = $priceValue;
-                    $itemsById[$elementId]['PRICE_FORMATTED'] = $this->formatPrice($priceValue, $currency);
-                }
-
-                if (isset($quantities[$elementId])) {
-                    $itemsById[$elementId]['QUANTITY'] = (float)$quantities[$elementId];
-                }
-            }
-        }
-
         return [
-            'ITEMS' => array_values($itemsById),
+            'ITEMS' => $items,
             'CURRENT_SORT' => $sortDirection,
         ];
     }
 
-    private function loadPrices(array $elementIds, int $basePriceGroupId): array
-    {
-        $prices = [];
-
-        $result = PriceTable::getList([
-            'select' => ['PRODUCT_ID', 'PRICE', 'CURRENCY'],
-            'filter' => [
-                '=PRODUCT_ID' => $elementIds,
-                '=CATALOG_GROUP_ID' => $basePriceGroupId,
-            ],
-        ]);
-
-        while ($row = $result->fetch()) {
-            $prices[(int)$row['PRODUCT_ID']] = [
-                'PRICE' => (float)$row['PRICE'],
-                'CURRENCY' => (string)$row['CURRENCY'],
-            ];
-        }
-
-        return $prices;
-    }
-
-    private function loadQuantities(array $elementIds): array
-    {
-        $quantities = [];
-        $result = ProductTable::getList([
-            'select' => ['ID', 'QUANTITY'],
-            'filter' => ['=ID' => $elementIds],
-        ]);
-
-        while ($row = $result->fetch()) {
-            $quantities[(int)$row['ID']] = (float)$row['QUANTITY'];
-        }
-
-        return $quantities;
-    }
-
     private function formatPrice(float $price, string $currency): string
     {
-        if (Loader::includeModule('currency') && class_exists('CCurrencyLang')) {
-            return CCurrencyLang::CurrencyFormat($price, $currency, true);
+        $symbol = $this->currencySymbols[$currency] ?? $currency;
+        if ($symbol === '') {
+            $symbol = $currency;
         }
 
-        return number_format($price, 2, '.', ' ') . ' ' . $currency;
+        return number_format($price, 2, '.', ' ') . ' ' . $symbol;
+    }
+
+    private function buildDetailUrl(array $row): string
+    {
+        $template = (string)($row['DETAIL_URL_TEMPLATE'] ?? '');
+        if ($template === '') {
+            return '';
+        }
+
+        $elementId = (int)($row['ID'] ?? 0);
+        $fields = [
+            'ID' => $elementId,
+            'ELEMENT_ID' => $elementId,
+            'CODE' => (string)($row['CODE'] ?? ''),
+            'ELEMENT_CODE' => (string)($row['CODE'] ?? ''),
+            'EXTERNAL_ID' => (string)($row['XML_ID'] ?? ''),
+            'IBLOCK_TYPE_ID' => (string)($row['IBLOCK_TYPE_ID'] ?? ''),
+            'IBLOCK_ID' => (int)($row['IBLOCK_ID'] ?? 0),
+            'IBLOCK_CODE' => (string)($row['IBLOCK_CODE'] ?? ''),
+            'IBLOCK_EXTERNAL_ID' => (string)($row['IBLOCK_XML_ID'] ?? ''),
+            'IBLOCK_SECTION_ID' => (int)($row['IBLOCK_SECTION_ID'] ?? 0),
+            'LANG_DIR' => defined('SITE_DIR') ? (string)SITE_DIR : '/',
+            'LID' => defined('SITE_ID') ? (string)SITE_ID : '',
+        ];
+
+        $url = CIBlock::ReplaceDetailUrl($template, $fields, true, 'E');
+        $url = is_string($url) ? $url : '';
+
+        if ($url === '' || $this->hasUnresolvedMacros($url)) {
+            return '';
+        }
+
+        return $url;
+    }
+
+    private function hasUnresolvedMacros(string $url): bool
+    {
+        return (bool)preg_match('/#[A-Z0-9_]+#/', $url);
     }
 
     private function registerIblockTag(int $iblockId): void
@@ -181,10 +229,10 @@ class DemoProductCatalogComponent extends CBitrixComponent
             return;
         }
 
-        global $CACHE_MANAGER;
-        $CACHE_MANAGER->StartTagCache($this->GetCachePath());
-        $CACHE_MANAGER->RegisterTag('iblock_id_' . $iblockId);
-        $CACHE_MANAGER->EndTagCache();
+        $taggedCache = Application::getInstance()->getTaggedCache();
+        $taggedCache->startTagCache($this->GetCachePath());
+        $taggedCache->registerTag('iblock_id_' . $iblockId);
+        $taggedCache->endTagCache();
     }
 
     private function abortManagedCache(): void
@@ -193,7 +241,6 @@ class DemoProductCatalogComponent extends CBitrixComponent
             return;
         }
 
-        global $CACHE_MANAGER;
-        $CACHE_MANAGER->AbortTagCache();
+        Application::getInstance()->getTaggedCache()->abortTagCache();
     }
 }

@@ -31,7 +31,11 @@ $sortDescUrl = $APPLICATION->GetCurPageParam('sort=desc', ['sort']);
             <?php foreach ($arResult['ITEMS'] as $item): ?>
                 <tr>
                     <td>
-                        <a href="<?=htmlspecialcharsbx($item['DETAIL_PAGE_URL'])?>"><?=htmlspecialcharsbx($item['NAME'])?></a>
+                        <?php if (!empty($item['DETAIL_PAGE_URL'])): ?>
+                            <a href="<?=htmlspecialcharsbx($item['DETAIL_PAGE_URL'])?>"><?=htmlspecialcharsbx($item['NAME'])?></a>
+                        <?php else: ?>
+                            <?=htmlspecialcharsbx($item['NAME'])?>
+                        <?php endif; ?>
                     </td>
                     <td><?=(string)$item['PRICE_FORMATTED']?></td>
                     <td><?=htmlspecialcharsbx(rtrim(rtrim(number_format((float)$item['QUANTITY'], 2, '.', ''), '0'), '.'))?></td>
