@@ -6,7 +6,6 @@ if (!defined('B_PROLOG_INCLUDED') || B_PROLOG_INCLUDED !== true) {
 use Bitrix\Catalog\GroupTable;
 use Bitrix\Catalog\PriceTable;
 use Bitrix\Catalog\ProductTable;
-use Bitrix\Currency\CurrencyManager;
 use Bitrix\Iblock\ElementTable;
 use Bitrix\Iblock\IblockTable;
 use Bitrix\Main\Application;
@@ -19,7 +18,7 @@ use Bitrix\Main\Type\DateTime;
 
 class DemoProductCatalogComponent extends CBitrixComponent
 {
-    private array $currencySymbols = [];
+    private bool $isCurrencyModuleLoaded = false;
 
     public function onPrepareComponentParams($arParams)
     {
@@ -39,9 +38,7 @@ class DemoProductCatalogComponent extends CBitrixComponent
             return;
         }
 
-        if (Loader::includeModule('currency')) {
-            $this->currencySymbols = CurrencyManager::getSymbolList();
-        }
+        $this->isCurrencyModuleLoaded = Loader::includeModule('currency');
 
         if ($this->arParams['IBLOCK_ID'] <= 0) {
             ShowError('Некорректный IBLOCK_ID');
@@ -164,7 +161,7 @@ class DemoProductCatalogComponent extends CBitrixComponent
                 'NAME' => (string)$row['NAME'],
                 'DETAIL_PAGE_URL' => $this->buildDetailUrl($row),
                 'PRICE' => $priceValue,
-                'PRICE_FORMATTED' => $priceValue !== null ? $this->formatPrice($priceValue, $currency) : '—',
+                'PRICE_FORMATTED' => $priceValue !== null ? CurrencyFormat($priceValue, $currency) : '—',
                 'QUANTITY' => (float)($row['QUANTITY_VALUE'] ?? 0),
             ];
         }
@@ -173,16 +170,6 @@ class DemoProductCatalogComponent extends CBitrixComponent
             'ITEMS' => $items,
             'CURRENT_SORT' => $sortDirection,
         ];
-    }
-
-    private function formatPrice(float $price, string $currency): string
-    {
-        $symbol = $this->currencySymbols[$currency] ?? $currency;
-        if ($symbol === '') {
-            $symbol = $currency;
-        }
-
-        return number_format($price, 2, '.', ' ') . ' ' . $symbol;
     }
 
     private function buildDetailUrl(array $row): string
@@ -209,18 +196,8 @@ class DemoProductCatalogComponent extends CBitrixComponent
         ];
 
         $url = CIBlock::ReplaceDetailUrl($template, $fields, true, 'E');
-        $url = is_string($url) ? $url : '';
 
-        if ($url === '' || $this->hasUnresolvedMacros($url)) {
-            return '';
-        }
-
-        return $url;
-    }
-
-    private function hasUnresolvedMacros(string $url): bool
-    {
-        return (bool)preg_match('/#[A-Z0-9_]+#/', $url);
+        return is_string($url) ? $url : '';
     }
 
     private function registerIblockTag(int $iblockId): void
