@@ -1,0 +1,32 @@
+services:
+  db:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password --sql_mode=""
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: bitrix
+      MYSQL_USER: bitrix
+      MYSQL_PASSWORD: bitrix
+    volumes:
+      - db_data:/var/lib/mysql
+    ports:
+    - "3307:3306"
+
+
+  web:
+    image: webdevops/php-apache:8.2
+    ports:
+      - "8080:80"
+    volumes:
+      - ./:/app
+      - ./docker/php/conf.d/99-bitrix.ini:/usr/local/etc/php/conf.d/99-bitrix.ini:ro
+    environment:
+      WEB_DOCUMENT_ROOT: /app
+      PHP_MEMORY_LIMIT: 512M
+      PHP_POST_MAX_SIZE: 64M
+      PHP_UPLOAD_MAX_FILESIZE: 64M
+    depends_on:
+      - db
+
+volumes:
+  db_data:
